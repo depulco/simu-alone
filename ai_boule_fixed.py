@@ -8,7 +8,9 @@ from torch import nn
 from torch.distributions import Normal
 
 from create_simulation_fixed import create_sim_test_nn
-
+print(torch.__version__)
+print("CUDA:", torch.cuda.is_available())
+print(torch.cuda.device_count())
 
 # ----------------------------- Models -----------------------------
 class Actor(nn.Module):
@@ -127,13 +129,14 @@ class BouleEnv:
 
 
 # ----------------------------- Rollout & GAE -----------------------------
-def rollout_episode(env: BouleEnv, actor: Actor, critic: Critic):
+def rollout_episode(env: BouleEnv, actor: Actor, critic: Critic, device):
     s = env.reset()
 
     states, actions, logps, rewards, values, dones = [], [], [], [], [], []
 
     for _ in range(env.cfg.max_steps):
         s_t = s if isinstance(s, torch.Tensor) else torch.tensor(s, dtype=torch.float32)
+        s_t = s_t.to(device)
 
         dist = actor(s_t)
         v = critic(s_t)
@@ -146,9 +149,9 @@ def rollout_episode(env: BouleEnv, actor: Actor, critic: Critic):
         states.append(s_t)
         actions.append(a)
         logps.append(logp)
-        rewards.append(torch.tensor(r, dtype=torch.float32))
+        rewards.append(torch.tensor(r, dtype=torch.float32, device=device))
         values.append(v)
-        dones.append(torch.tensor(float(done), dtype=torch.float32))
+        dones.append(torch.tensor(float(done), dtype=torch.float32, device=device))
 
         s = s2
         if done:
@@ -170,12 +173,12 @@ def compute_gae(rewards: List[torch.Tensor], values: List[torch.Tensor], dones: 
     return adv, returns
 
 
-def collect_batch(env: BouleEnv, actor: Actor, critic: Critic, n_rollouts: int):
+def collect_batch(env: BouleEnv, actor: Actor, critic: Critic, n_rollouts: int, device):
     all_states, all_actions, all_logps, all_rewards, all_values, all_dones = [], [], [], [], [], []
     ep_returns = []
 
     for _ in range(n_rollouts):
-        states, actions, logps, rewards, values, dones = rollout_episode(env, actor, critic)
+        states, actions, logps, rewards, values, dones = rollout_episode(env, actor, critic, device)
         all_states += states
         all_actions += actions
         all_logps += logps
@@ -198,14 +201,16 @@ def ppo_update(
     logps_old,
     returns,
     adv,
+    device,
     clip_eps=0.2,
-    entropy_coef=0.01,
+    entropy_coef=0.01
+    
 ):
-    states = torch.stack(states)
-    actions = torch.stack(actions)
-    logps_old = torch.stack(logps_old).detach()
-    returns = torch.stack(returns).detach()
-    adv = torch.stack(adv).detach()
+    states = torch.stack(states).to(device)
+    actions = torch.stack(actions).to(device)
+    logps_old = torch.stack(logps_old).detach().to(device)
+    returns = torch.stack(returns).detach().to(device)
+    adv = torch.stack(adv).detach().to(device)
 
     # skip too-small batches
     if states.shape[0] < 2:
@@ -246,18 +251,20 @@ def ppo_update(
 
 # ----------------------------- Main -----------------------------
 def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Device:", device)
     torch.manual_seed(0)
     random.seed(0)
 
     cfg = EnvConfig()
     env = BouleEnv(cfg, seed=0)
 
-    actor = Actor(state_dim=12, action_dim=3)
-    critic = Critic(state_dim=12)
+    actor = Actor(12, 3).to(device)
+    critic = Critic(12).to(device)
 
     # resume actor if available
     if os.path.exists("policy.pt"):
-        actor.load_state_dict(torch.load("policy.pt", map_location="cpu"))
+        actor.load_state_dict(torch.load("policy.pt", map_location=device))
         actor.eval()
         print(" policy.pt chargé -> reprise de l'actor")
     else:
@@ -273,12 +280,12 @@ def main():
 
     best = None
     for it in range(1, ITERS + 1):
-        states, actions, logps, rewards, values, dones, ep_returns = collect_batch(env, actor, critic, N_ROLLOUTS)
+        states, actions, logps, rewards, values, dones, ep_returns = collect_batch(env, actor, critic, N_ROLLOUTS, device)
         adv, rets = compute_gae(rewards, values, dones)
 
         pl, vl = 0.0, 0.0
         for _ in range(PPO_EPOCHS):
-            pl, vl = ppo_update(actor, critic, opt_a, opt_c, states, actions, logps, rets, adv)
+            pl, vl = ppo_update(actor, critic, opt_a, opt_c, states, actions, logps, rets, adv, device)
 
         mean_return = sum(ep_returns) / max(1, len(ep_returns))
 

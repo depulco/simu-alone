@@ -47,7 +47,9 @@ class Eye:
         self.boule = parent_boule
         self.saw_spike = False
     def get_vect(self):
-        return pygame.math.Vector2.from_polar((self.lenght,self.angle+self.boule.angle))
+        v = pygame.math.Vector2()
+        v.from_polar((self.lenght, self.angle + self.boule.angle))
+        return v
     def get_end_sight(self):
         vect = self.get_vect()
         return (self.boule.x+vect[0], self.boule.y+vect[1])
@@ -159,7 +161,7 @@ class Boule:
                 y_channel = 0
         self.x += x_channel
         self.y +=y_channel
-        self.angle +=rot_channel
+        self.angle +=rot_channel %360
 
     def make_immortal(self):
         self.immortal = True
