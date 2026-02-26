@@ -1,71 +1,12 @@
 import os
 import glob
+import math
 import random
 import pygame
 import torch
-import copy
-from collections import deque
 
-from create_simulation_fixed import create_sim_test_nn
-
-
-# ----------------------- Pilot -----------------------
-class BouleNNPilot:
-    def __init__(self, boule, policy, speed=2.0, rot_speed=3.0, stochastic=False, device="cpu"):
-        self.boule = boule
-        self.policy = policy.to(device).eval()
-        self.speed = float(speed)
-        self.rot_speed = float(rot_speed)
-        self.stochastic = stochastic
-        self.device = device
-
-    def get_move(self):
-        with torch.inference_mode():
-            s = self.boule.get_nn_input().to(self.device)  # [12]
-            dist = self.policy(s)
-            a = dist.sample() if self.stochastic else dist.mean
-            a = torch.tanh(a)
-        return (
-            float(a[0].item() * self.speed),
-            float(a[1].item() * self.speed),
-            float(a[2].item() * self.rot_speed),
-        )
-
-
-# ----------------------- Model -----------------------
-class Actor(torch.nn.Module):
-    def __init__(self, state_dim=20, action_dim=3, hidden=128):
-        super().__init__()
-        self.net = torch.nn.Sequential(
-            torch.nn.Linear(state_dim, hidden),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden, hidden),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden, hidden),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden, action_dim),
-        )
-        self.log_std = torch.nn.Parameter(torch.zeros(action_dim))
-
-    def forward(self, x):
-        from torch.distributions import Normal
-        mu = self.net(x)
-        std = self.log_std.exp().expand_as(mu)
-        return Normal(mu, std)
-
-
-# ----------------------- Loading -----------------------
-def load_policy_any(path, device="cpu"):
-    policy = Actor().to(device)
-    obj = torch.load(path, map_location=device)
-
-    if isinstance(obj, dict) and "actor" in obj:
-        policy.load_state_dict(obj["actor"])
-    else:
-        policy.load_state_dict(obj)
-
-    policy.eval()
-    return policy
+from env_tensor import EnvConfigTensor, BouleEnvTensor
+from ai_boule_tensor import Actor
 
 
 def list_checkpoints():
@@ -77,254 +18,252 @@ def list_checkpoints():
     return files
 
 
-# ----------------------- Game -----------------------
+def load_policy_any(path, device="cpu"):
+    policy = Actor(state_dim=20, action_dim=3).to(device)
+    obj = torch.load(path, map_location=device, weights_only=True)
+
+    if isinstance(obj, dict) and "actor" in obj:
+        policy.load_state_dict(obj["actor"])
+    else:
+        policy.load_state_dict(obj)
+
+    policy.eval()
+    return policy
+
+
 class Game:
-    def __init__(self, win_w, win_h, board):
+    def __init__(self, env, policy, files, idx, device="cpu"):
         pygame.init()
-        self.board = board
-        self.world = pygame.Surface((board.width, board.height))
-        self.screen = pygame.display.set_mode((win_w, win_h), pygame.RESIZABLE)
-        self.clock = pygame.time.Clock()
-        self.running = True
-
-        self.show_eyes = True
-        self.show_spike_eyes = False  # ✅ en mode "sans spikes", inutile -> laisse False
-        self.fps = 120
-
-        self.paused = False
-        self.step_once = False
-
         pygame.font.init()
+
+        self.env = env
+        self.policy = policy
+        self.files = files
+        self.idx = idx
+        self.device = device
+
+        self.screen = pygame.display.set_mode((1000, 1000), pygame.RESIZABLE)
+        self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("consolas", 18)
 
-        # rewind buffer
-        self.history = deque(maxlen=600)
-        self.history_idx = -1
-        self.push_snapshot()  # snapshot initial
+        self.running = True
+        self.paused = False
+        self.step_once = False
+        self.show_eyes = True
+        self.show_spike_eyes = True
+        self.fps = 120
 
-    # ----------- rewind helpers -----------
-    def push_snapshot(self):
-        while len(self.history) - 1 > self.history_idx:
-            self.history.pop()
-        self.history.append(copy.deepcopy(self.board))
-        self.history_idx = len(self.history) - 1
+        self.state = self.env.reset()
+        self.done = False
+        self.total_reward = 0.0
+        self.steps = 0
 
-    def pop_snapshot(self):
-        if self.history_idx > 0:
-            self.history_idx -= 1
-            self.board = copy.deepcopy(self.history[self.history_idx])
-            self.world = pygame.Surface((self.board.width, self.board.height))
+        self.set_caption()
 
-    def clear_history(self):
-        self.history.clear()
-        self.history_idx = -1
-        self.push_snapshot()
+    def set_caption(self):
+        name = os.path.basename(self.files[self.idx]) if self.files else "NO_MODEL"
+        pygame.display.set_caption(
+            f"Tensor Watch | [{self.idx+1}/{len(self.files)}] {name} | "
+            f"SPACE pause | N step | R reset | E eyes | X spike-eyes | ←/→ model"
+        )
 
-    # ----------- drawing -----------
-    def draw_spikes(self):
-        # ✅ pas de spikes -> ne dessine rien
-        for spike in self.board.spikes:
-            rect = pygame.Rect(
-                spike.get_x() - (spike.get_radius() * 0.70),
-                spike.get_y() - (spike.get_radius() * 0.70),
-                spike.get_radius() * 1.41,
-                spike.get_radius() * 1.41,
-            )
-            pygame.draw.rect(self.world, "red", rect)
+    def reset_env(self):
+        self.state = self.env.reset()
+        self.done = False
+        self.total_reward = 0.0
+        self.steps = 0
 
-    def draw_food(self):
-        for food in self.board.foods:
-            if not food.get_eaten():
-                pygame.draw.circle(self.world, "green", (food.get_x(), food.get_y()), food.get_radius())
-
-    def draw_boules(self):
-        for boule in self.board.boules:
-            if boule.is_dead():
-                continue
-            pygame.draw.circle(self.world, "blue", (boule.get_x(), boule.get_y()), boule.get_radius())
-
-            if not self.show_eyes:
-                continue
-
-            # food eyes
-            for i, eye in enumerate(boule.get_food_eyes()):
-                color = "orange" if boule.saw_by_food_eyes[i] != 1 else "green"
-                pygame.draw.line(self.world, color, (boule.x, boule.y), eye.get_end_sight())
-
-            # spike eyes (optionnel)
-            if self.show_spike_eyes:
-                for i, eye in enumerate(boule.get_spike_eyes()):
-                    color = "purple" if boule.saw_by_spike_eyes[i] != 1 else "yellow"
-                    pygame.draw.line(self.world, color, (boule.x, boule.y), eye.get_end_sight())
-
-    def overlay_text(self, lines):
-        y = 8
-        for line in lines:
-            surf = self.font.render(line, True, (0, 0, 0))
-            self.screen.blit(surf, (8, y))
-            y += 20
+    def change_model(self, delta):
+        self.idx = (self.idx + delta) % len(self.files)
+        self.policy = load_policy_any(self.files[self.idx], device=self.device)
+        print("✅ chargé:", self.files[self.idx])
+        self.set_caption()
+        self.reset_env()
 
     def handle_events(self):
         keys = []
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
-            if event.type == pygame.KEYDOWN:
+            elif event.type == pygame.KEYDOWN:
                 keys.append(event.key)
         return keys
 
-    def step_and_render(self, overlay_lines=None):
-        keys = self.handle_events()
+    def draw_text(self, lines):
+        y = 8
+        for line in lines:
+            surf = self.font.render(line, True, (0, 0, 0))
+            self.screen.blit(surf, (8, y))
+            y += 20
 
-        if pygame.K_ESCAPE in keys:
-            self.running = False
-        if pygame.K_e in keys:
-            self.show_eyes = not self.show_eyes
-        if pygame.K_SPACE in keys:
-            self.paused = not self.paused
-        if pygame.K_n in keys:
-            self.step_once = True
-        if pygame.K_b in keys and self.paused:
-            self.pop_snapshot()
-        if pygame.K_x in keys:
-            # ✅ option : afficher/cacher spike eyes (même si spikes=0)
-            self.show_spike_eyes = not self.show_spike_eyes
+    def draw_world(self):
+        board = self.env.board
 
-        do_step = (not self.paused) or self.step_once
-        if do_step:
-            self.push_snapshot()
-            self.board.run()
-            self.step_once = False
+        world_w = int(board.width)
+        world_h = int(board.height)
+        world = pygame.Surface((world_w, world_h))
+        world.fill("white")
 
-        # render
-        self.world.fill("white")
-        self.draw_food()
-        # self.draw_spikes()  # inutile si spikes=0, mais tu peux laisser si tu veux
-        self.draw_boules()
+        # ---------------- Food
+        food_pos = board.food_pos.detach().cpu()
+        food_alive = board.food_alive.detach().cpu()
 
-        scaled = pygame.transform.scale(self.world, self.screen.get_size())
+        for i in range(board.nb_food):
+            if bool(food_alive[i]):
+                x, y = food_pos[i].tolist()
+                pygame.draw.circle(
+                    world,
+                    "green",
+                    (int(x), int(y)),
+                    int(board.food_radius)
+                )
+
+        # ---------------- Spikes
+        if board.nb_spikes > 0:
+            spike_pos = board.spike_pos.detach().cpu()
+            for i in range(board.nb_spikes):
+                x, y = spike_pos[i].tolist()
+                rect = pygame.Rect(
+                    int(x - board.spike_radius * 0.70),
+                    int(y - board.spike_radius * 0.70),
+                    int(board.spike_radius * 1.41),
+                    int(board.spike_radius * 1.41),
+                )
+                pygame.draw.rect(world, "red", rect)
+
+        # ---------------- Boule
+        dead = bool(board.boule_dead[0].item()) or self.done
+        boule_pos = board.boule_pos[0].detach().cpu()
+        bx, by = boule_pos.tolist()
+
+        if not dead:
+            pygame.draw.circle(
+                world,
+                "blue",
+                (int(bx), int(by)),
+                int(board.boule_radius)
+            )
+
+        # ---------------- Eyes
+        if self.show_eyes and not dead:
+            angle = float(board.boule_angle[0].item())
+
+            # état courant :
+            # [x, y, angle, energy] + spike_eyes(8) + food_eyes(8)
+            state_cpu = self.state.detach().cpu()
+            spike_eye_vals = state_cpu[4:12].tolist()
+            food_eye_vals = state_cpu[12:20].tolist()
+
+            # food eyes
+            for i, offset in enumerate(board.food_eye_offsets.detach().cpu().tolist()):
+                eye_angle_deg = angle + offset
+                eye_angle_rad = math.radians(eye_angle_deg)
+                ex = bx + math.cos(eye_angle_rad) * board.eye_length
+                ey = by + math.sin(eye_angle_rad) * board.eye_length
+
+                color = "orange" if food_eye_vals[i] < 1.0 else "green"
+                pygame.draw.line(world, color, (bx, by), (ex, ey), 1)
+
+            # spike eyes
+            if self.show_spike_eyes:
+                for i, offset in enumerate(board.spike_eye_offsets.detach().cpu().tolist()):
+                    eye_angle_deg = angle + offset
+                    eye_angle_rad = math.radians(eye_angle_deg)
+                    ex = bx + math.cos(eye_angle_rad) * board.eye_length
+                    ey = by + math.sin(eye_angle_rad) * board.eye_length
+
+                    color = "purple" if spike_eye_vals[i] < 1.0 else "yellow"
+                    pygame.draw.line(world, color, (bx, by), (ex, ey), )
+
+        scaled = pygame.transform.scale(world, self.screen.get_size())
         self.screen.blit(scaled, (0, 0))
 
-        if overlay_lines:
-            self.overlay_text(overlay_lines)
+    def step_model(self):
+        if self.done:
+            return
 
-        pygame.display.flip()
-        self.clock.tick(self.fps)
+        with torch.inference_mode():
+            dist = self.policy(self.state.to(self.device))
+            a = torch.tanh(dist.mean)
 
-        return keys
+        self.state, r, self.done, _ = self.env.step(a)
+        self.total_reward += r
+        self.steps += 1
+
+    def run(self):
+        while self.running:
+            keys = self.handle_events()
+
+            if pygame.K_ESCAPE in keys:
+                self.running = False
+            if pygame.K_SPACE in keys:
+                self.paused = not self.paused
+            if pygame.K_n in keys:
+                self.step_once = True
+            if pygame.K_r in keys:
+                self.reset_env()
+            if pygame.K_e in keys:
+                self.show_eyes = not self.show_eyes
+            if pygame.K_x in keys:
+                self.show_spike_eyes = not self.show_spike_eyes
+            if pygame.K_LEFT in keys:
+                self.change_model(-1)
+            if pygame.K_RIGHT in keys:
+                self.change_model(1)
+
+            do_step = (not self.paused) or self.step_once
+            if do_step:
+                self.step_model()
+                self.step_once = False
+
+            self.screen.fill("white")
+            self.draw_world()
+
+            board = self.env.board
+            remaining_food = int(board.food_alive.sum().item()) if board.nb_food > 0 else 0
+            dead = bool(board.boule_dead[0].item()) or self.done
+            bx = float(board.boule_pos[0, 0].item())
+            by = float(board.boule_pos[0, 1].item())
+            angle = float(board.boule_angle[0].item())
+            energy = float(board.boule_energy[0].item())
+
+            overlay = [
+                f"model: {os.path.basename(self.files[self.idx])} ({self.idx+1}/{len(self.files)})",
+                f"device: {self.device}   paused: {self.paused}   done: {self.done}   dead: {dead}",
+                f"pos: ({bx:.1f},{by:.1f})  angle:{angle:.1f}  energy:{energy:.1f}",
+                f"food remaining: {remaining_food}   return: {self.total_reward:.2f}   steps: {self.steps}",
+                "keys: LEFT/RIGHT model | R reset | SPACE pause | N step | E eyes | X spike-eyes | ESC quit",
+            ]
+            self.draw_text(overlay)
+
+            pygame.display.flip()
+            self.clock.tick(self.fps)
+
+        pygame.quit()
 
 
-def board_signature(board):
-    foods = [(f.x, f.y) for f in board.foods[:3]]
-    return hash(tuple(foods))
-
-
-def attach_policy_to_current_board(board, policy, stochastic=False):
-    if board.boules:
-        board.boules[0].set_pilot(BouleNNPilot(board.boules[0], policy, stochastic=stochastic))
-
-
-def make_board(policy=None, stochastic=False):
-    seed = random.randrange(0, 2**31 - 1)
-    board = create_sim_test_nn(
-        500, 500,
-        nombre_spikes=0,   # ✅ AUCUN spike
-        nombre_food=12,
-        nombre_boule=1,
-        seed=seed,
-        actor_model=None,
-    )
-    print("NEW MAP seed=", getattr(board, "_seed", seed), "sig=", board_signature(board))
-
-    if policy is not None and board.boules:
-        attach_policy_to_current_board(board, policy, stochastic=stochastic)
-
-    return board
-
-
-def set_caption(files, idx, stochastic):
-    name = os.path.basename(files[idx]) if files else "NO_MODEL"
-    mode = "sample" if stochastic else "mean"
-    pygame.display.set_caption(
-        f"Boule NN (FOOD ONLY) | [{idx+1}/{len(files)}] {name} | mode={mode} | ←/→ change | SHIFT+←/→ change+reset | R reset | SPACE pause | N step | B back"
-    )
-
-
-# ----------------------- Main -----------------------
 if __name__ == "__main__":
     device = "cpu"
     files = list_checkpoints()
 
     if not files:
-        print("❌ Aucun modèle trouvé (ni checkpoints/*.pt ni policy.pt).")
+        print("Aucun modèle trouvé.")
         raise SystemExit(1)
 
-    idx = 0
-    stochastic = False
-
+    idx = len(files) - 1
     policy = load_policy_any(files[idx], device=device)
-    print("✅ chargé:", files[idx])
 
-    board = make_board(policy=policy, stochastic=stochastic)
-    game = Game(1000, 1000, board)
-    set_caption(files, idx, stochastic)
+    env = BouleEnvTensor(
+        EnvConfigTensor(
+            width=500,
+            height=500,
+            nb_food=12,
+            nb_spikes=0,
+            max_steps=5000,
+            device=device,
+        ),
+        seed=0,
+    )
 
-    while game.running:
-        boule = game.board.boules[0]
-        remaining_food = sum(1 for f in game.board.foods if not f.get_eaten())
-        overlay = [
-            f"model: {os.path.basename(files[idx])}  ({idx+1}/{len(files)})",
-            f"mode: {'sample' if stochastic else 'mean'}   paused: {game.paused}",
-            f"pos: ({boule.x:.1f},{boule.y:.1f})  angle:{boule.angle:.1f}  energy:{boule.energy}",
-            f"food remaining: {remaining_food}   dead:{boule.is_dead()}",
-            "keys: ←/→ change | SHIFT+←/→ change+reset | R reset | S stochastic | SPACE pause | N step | B back | E eyes | X spike-eyes",
-        ]
-
-        keys = game.step_and_render(overlay_lines=overlay)
-
-        # Reset map
-        if pygame.K_r in keys:
-            game.board = make_board(policy=policy, stochastic=stochastic)
-            game.world = pygame.Surface((game.board.width, game.board.height))
-            game.clear_history()
-
-        # Toggle stochastic
-        if pygame.K_s in keys:
-            stochastic = not stochastic
-            attach_policy_to_current_board(game.board, policy, stochastic=stochastic)
-            set_caption(files, idx, stochastic)
-
-        mods = pygame.key.get_mods()
-        shift = (mods & pygame.KMOD_SHIFT) != 0
-
-        # Previous model
-        if pygame.K_LEFT in keys:
-            idx = (idx - 1) % len(files)
-            policy = load_policy_any(files[idx], device=device)
-            print("✅ chargé:", files[idx])
-
-            if shift:
-                game.board = make_board(policy=policy, stochastic=stochastic)
-                game.world = pygame.Surface((game.board.width, game.board.height))
-                game.clear_history()
-            else:
-                attach_policy_to_current_board(game.board, policy, stochastic=stochastic)
-                game.clear_history()
-
-            set_caption(files, idx, stochastic)
-
-        # Next model
-        if pygame.K_RIGHT in keys:
-            idx = (idx + 1) % len(files)
-            policy = load_policy_any(files[idx], device=device)
-            print(" chargé:", files[idx])
-
-            if shift:
-                game.board = make_board(policy=policy, stochastic=stochastic)
-                game.world = pygame.Surface((game.board.width, game.board.height))
-                game.clear_history()
-            else:
-                attach_policy_to_current_board(game.board, policy, stochastic=stochastic)
-                game.clear_history()
-
-            set_caption(files, idx, stochastic)
+    game = Game(env, policy, files, idx, device=device)
+    game.run()
