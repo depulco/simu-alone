@@ -46,9 +46,9 @@ def create_sim_test_nn(
                 angle = rng.randint(0, 359)
                 boule = Boule(x, y, angle, board)
                 board.add_boule(boule)
-                boule.set_eyes(even_spaced_eyes(4, 0, 40, boule), "food")
-                boule.set_eyes(even_spaced_eyes(4, 45, 40, boule), "spike")
-                boule.set_pilot(False)
+                boule.set_eyes(even_spaced_eyes(8, 0, 140, boule), "food")
+                boule.set_eyes(even_spaced_eyes(8, 4, 140, boule), "spike")
+                boule.set_pilot(False)  
                 boule_positions.append((x, y))
                 break
 

@@ -1,23 +1,25 @@
 import os
 import random
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List
+import csv
+from datetime import datetime
 
 import torch
 from torch import nn
 from torch.distributions import Normal
 
 from create_simulation_fixed import create_sim_test_nn
-print(torch.__version__)
-print("CUDA:", torch.cuda.is_available())
-print(torch.cuda.device_count())
+
 
 # ----------------------------- Models -----------------------------
 class Actor(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden: int = 64):
+    def __init__(self, state_dim: int, action_dim: int, hidden: int = 128):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
@@ -32,10 +34,12 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, state_dim: int, hidden: int = 64):
+    def __init__(self, state_dim: int, hidden: int = 128):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
@@ -54,7 +58,7 @@ class EnvConfig:
     max_steps: int = 600
     speed: float = 2.0
     rot_speed: float = 3.0
-    nb_spikes: int = 5
+    nb_spikes: int = 0     # PHASE A
     nb_food: int = 12
     nb_boules: int = 1
 
@@ -69,7 +73,6 @@ class BouleEnv:
         self.prev_eaten = 0
 
     def reset(self):
-        # New random map each episode
         self.board = create_sim_test_nn(
             self.cfg.width,
             self.cfg.height,
@@ -79,6 +82,7 @@ class BouleEnv:
             seed=self.seed + self.rng.randint(0, 10_000),
             actor_model=None,
         )
+
         self.steps = 0
         self.prev_eaten = self._eaten_count()
 
@@ -96,6 +100,7 @@ class BouleEnv:
 
     def step(self, action: torch.Tensor):
         boule = self.board.boules[0]
+        E0 = boule.energy
 
         a = torch.tanh(action)
         dx = float(a[0].item() * self.cfg.speed)
@@ -106,38 +111,42 @@ class BouleEnv:
         self.board.run()
         self.steps += 1
 
+        E1 = boule.energy
+        done = (boule.energy <= 0) or (self.steps >= self.cfg.max_steps)
+
+        # Reward simple: gros signal "manger"
+        energy_gain = max(0, E1 - E0)          # 300 quand il mange
+        eat_reward = 0.03 * float(energy_gain) # +9 par nourriture
+
         eaten = self._eaten_count()
         delta_eaten = eaten - self.prev_eaten
         self.prev_eaten = eaten
+        eat_count_reward = 1.0 * float(delta_eaten)
 
-        done = boule.is_dead() or (self.steps >= self.cfg.max_steps)
+        time_pen = -0.005
+        act_pen = 0.001 * float((a * a).sum().item())
 
-        # penalties / shaping
-        min_spike = min(boule.saw_by_spike_eyes) if boule.saw_by_spike_eyes else 1.0
-        danger_pen = (0.25 - min_spike) * 2.0 if min_spike < 0.25 else 0.0
-        act_pen = 0.01 * float((a * a).sum().item())
+        reward = time_pen + eat_reward + eat_count_reward - act_pen
 
-        # optional shaping toward food (helps learning on random maps)
-        min_food = min(boule.saw_by_food_eyes) if boule.saw_by_food_eyes else 1.0
-        food_bonus = (1.0 - min_food) * 0.2
-
-        reward = 0.05 + 10.0 * float(delta_eaten) - danger_pen - act_pen + food_bonus
-        if boule.is_dead():
-            reward -= 10.0
+        if boule.energy <= 0:
+            reward -= 40.0
 
         return self._get_state(), float(reward), done, {}
 
 
-# ----------------------------- Rollout & GAE -----------------------------
+# ----------------------------- Rollout & GAE (bootstrap fix) -----------------------------
+@torch.no_grad()
 def rollout_episode(env: BouleEnv, actor: Actor, critic: Critic, device):
     s = env.reset()
 
     states, actions, logps, rewards, values, dones = [], [], [], [], [], []
+    start_eaten = env._eaten_count()
+
+    steps = 0
+    died = False
 
     for _ in range(env.cfg.max_steps):
-        s_t = s if isinstance(s, torch.Tensor) else torch.tensor(s, dtype=torch.float32)
-        s_t = s_t.to(device)
-
+        s_t = s.to(device) if isinstance(s, torch.Tensor) else torch.tensor(s, dtype=torch.float32, device=device)
         dist = actor(s_t)
         v = critic(s_t)
 
@@ -154,71 +163,94 @@ def rollout_episode(env: BouleEnv, actor: Actor, critic: Critic, device):
         dones.append(torch.tensor(float(done), dtype=torch.float32, device=device))
 
         s = s2
+        steps += 1
         if done:
+            died = (env.board.boules[0].energy <= 0)
             break
 
-    return states, actions, logps, rewards, values, dones
+    # Bootstrap si time limit (non-terminal)
+    last_value = torch.tensor(0.0, device=device)
+    if steps > 0:
+        time_limit = (steps >= env.cfg.max_steps) and (env.board.boules[0].energy > 0)
+        if time_limit:
+            s_last = s.to(device) if isinstance(s, torch.Tensor) else torch.tensor(s, dtype=torch.float32, device=device)
+            last_value = critic(s_last).detach()
+
+    end_eaten = env._eaten_count()
+    eaten_this_ep = end_eaten - start_eaten
+    ep_return = float(torch.stack(rewards).sum().item()) if rewards else 0.0
+
+    info = {
+        "return": ep_return,
+        "steps": steps,
+        "died": 1.0 if died else 0.0,
+        "eaten": float(eaten_this_ep),
+        "seed": getattr(env.board, "_seed", None),
+    }
+
+    return states, actions, logps, rewards, values, dones, last_value, info
 
 
-def compute_gae(rewards: List[torch.Tensor], values: List[torch.Tensor], dones: List[torch.Tensor], gamma=0.99, lam=0.95):
-    values = values + [torch.tensor(0.0)]
-    gae = 0.0
+def compute_gae(rewards, values, dones, last_value, gamma=0.99, lam=0.95):
+    vals = values + [last_value]
+    gae = torch.tensor(0.0, device=rewards[0].device)
     adv = []
+
     for t in reversed(range(len(rewards))):
         not_done = 1.0 - dones[t]
-        delta = rewards[t] + gamma * values[t + 1] * not_done - values[t]
+        delta = rewards[t] + gamma * vals[t + 1] * not_done - vals[t]
         gae = delta + gamma * lam * not_done * gae
         adv.insert(0, gae)
-    returns = [a + v for a, v in zip(adv, values[:-1])]
+
+    returns = [a + v for a, v in zip(adv, values)]
     return adv, returns
 
 
-def collect_batch(env: BouleEnv, actor: Actor, critic: Critic, n_rollouts: int, device):
-    all_states, all_actions, all_logps, all_rewards, all_values, all_dones = [], [], [], [], [], []
-    ep_returns = []
+def collect_batch(env, actor, critic, n_rollouts, device):
+    all_states, all_actions, all_logps = [], [], []
+    all_adv, all_rets = [], []
+    infos = []
 
     for _ in range(n_rollouts):
-        states, actions, logps, rewards, values, dones = rollout_episode(env, actor, critic, device)
+        states, actions, logps, rewards, values, dones, last_value, info = rollout_episode(env, actor, critic, device)
+        if len(rewards) == 0:
+            continue
+        adv, rets = compute_gae(rewards, values, dones, last_value)
         all_states += states
         all_actions += actions
         all_logps += logps
-        all_rewards += rewards
-        all_values += values
-        all_dones += dones
-        ep_returns.append(float(torch.stack(rewards).sum().item()) if rewards else 0.0)
+        all_adv += adv
+        all_rets += rets
+        infos.append(info)
 
-    return all_states, all_actions, all_logps, all_rewards, all_values, all_dones, ep_returns
+    return all_states, all_actions, all_logps, all_adv, all_rets, infos
+
+
+def mean(xs):
+    return sum(xs) / max(1, len(xs))
+
+
+def init_logger(path="train_log.csv"):
+    new_file = not os.path.exists(path)
+    f = open(path, "a", newline="")
+    w = csv.writer(f)
+    if new_file:
+        w.writerow(["time","it","mean_return","mean_eaten","death_rate","mean_steps","pl","vl","best","state_dim"])
+    return f, w
 
 
 # ----------------------------- PPO Update -----------------------------
-def ppo_update(
-    actor: Actor,
-    critic: Critic,
-    opt_a,
-    opt_c,
-    states,
-    actions,
-    logps_old,
-    returns,
-    adv,
-    device,
-    clip_eps=0.2,
-    entropy_coef=0.01
-    
-):
+def ppo_update(actor, critic, opt_a, opt_c, states, actions, logps_old, returns, adv, device, clip_eps=0.2, entropy_coef=0.01):
     states = torch.stack(states).to(device)
     actions = torch.stack(actions).to(device)
     logps_old = torch.stack(logps_old).detach().to(device)
     returns = torch.stack(returns).detach().to(device)
     adv = torch.stack(adv).detach().to(device)
 
-    # skip too-small batches
     if states.shape[0] < 2:
         return 0.0, 0.0
 
-    # normalize advantages safely
-    adv = adv - adv.mean()
-    adv = adv / (adv.std(unbiased=False) + 1e-8)
+    adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
 
     dist = actor(states)
     logps = dist.log_prob(actions).sum(dim=1)
@@ -236,9 +268,6 @@ def ppo_update(
 
     loss = policy_loss + 0.5 * value_loss
 
-    if not torch.isfinite(loss):
-        return float("nan"), float("nan")
-
     opt_a.zero_grad()
     opt_c.zero_grad()
     loss.backward()
@@ -249,8 +278,20 @@ def ppo_update(
     return float(policy_loss.item()), float(value_loss.item())
 
 
+def save_checkpoint(path, actor, critic, opt_a, opt_c, it, best, extra=None):
+    ckpt = {"it": it, "best": best, "actor": actor.state_dict(), "critic": critic.state_dict(),
+            "opt_a": opt_a.state_dict(), "opt_c": opt_c.state_dict()}
+    if extra is not None:
+        ckpt["extra"] = extra
+    torch.save(ckpt, path)
+
+
 # ----------------------------- Main -----------------------------
 def main():
+    print(torch.__version__)
+    print("CUDA:", torch.cuda.is_available())
+    print(torch.cuda.device_count())
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
     torch.manual_seed(0)
@@ -259,44 +300,69 @@ def main():
     cfg = EnvConfig()
     env = BouleEnv(cfg, seed=0)
 
-    actor = Actor(12, 3).to(device)
-    critic = Critic(12).to(device)
+    # ✅ détecte state_dim automatiquement (12, 20, etc.)
+    tmp_state = env.reset()
+    state_dim = int(tmp_state.numel())
+    print("Detected state_dim =", state_dim)
 
-    # resume actor if available
+    actor = Actor(state_dim, 3).to(device)
+    critic = Critic(state_dim).to(device)
+
+    # ✅ ne charge policy.pt QUE si compatible
     if os.path.exists("policy.pt"):
-        actor.load_state_dict(torch.load("policy.pt", map_location=device))
-        actor.eval()
-        print(" policy.pt chargé -> reprise de l'actor")
-    else:
-        print("ℹ policy.pt introuvable -> entraînement depuis 0")
+        sd = torch.load("policy.pt", map_location=device)
+        if isinstance(sd, dict) and "actor" in sd:
+            sd = sd["actor"]
+        try:
+            actor.load_state_dict(sd)
+            actor.eval()
+            print("policy.pt chargé")
+        except RuntimeError as e:
+            print("policy.pt incompatible avec state_dim actuel -> on repart de 0")
+            print("Erreur:", e)
 
     opt_a = torch.optim.Adam(actor.parameters(), lr=3e-4)
     opt_c = torch.optim.Adam(critic.parameters(), lr=1e-3)
 
-    # PPO batching
-    N_ROLLOUTS = 16      # episodes/maps per iteration
-    PPO_EPOCHS = 10      # gradient passes over the same batch
-    ITERS = 2000         # each iter uses N_ROLLOUTS episodes (so 2000*16=32000 episodes)
+    N_ROLLOUTS = 16
+    PPO_EPOCHS = 10
+    ITERS = 2000
+
+    log_f, log_w = init_logger("train_log.csv")
+    os.makedirs("checkpoints", exist_ok=True)
 
     best = None
-    for it in range(1, ITERS + 1):
-        states, actions, logps, rewards, values, dones, ep_returns = collect_batch(env, actor, critic, N_ROLLOUTS, device)
-        adv, rets = compute_gae(rewards, values, dones)
+    try:
+        for it in range(1, ITERS + 1):
+            states, actions, logps, adv, rets, infos = collect_batch(env, actor, critic, N_ROLLOUTS, device)
+            if len(states) < 2:
+                continue
 
-        pl, vl = 0.0, 0.0
-        for _ in range(PPO_EPOCHS):
-            pl, vl = ppo_update(actor, critic, opt_a, opt_c, states, actions, logps, rets, adv, device)
+            pl, vl = 0.0, 0.0
+            for _ in range(PPO_EPOCHS):
+                pl, vl = ppo_update(actor, critic, opt_a, opt_c, states, actions, logps, rets, adv, device)
 
-        mean_return = sum(ep_returns) / max(1, len(ep_returns))
+            mean_return = mean([i["return"] for i in infos])
+            mean_eaten  = mean([i["eaten"] for i in infos])
+            death_rate  = mean([i["died"] for i in infos])
+            mean_steps  = mean([i["steps"] for i in infos])
 
-        if best is None:
-            best = mean_return 
-        if mean_return > best:
-            best = mean_return
-            torch.save(actor.state_dict(), "policy.pt")
+            if best is None or mean_return > best:
+                best = mean_return
+                torch.save(actor.state_dict(), "policy.pt")
 
-        if it % 10 == 0:
-            print(f"it={it:4d} mean_return={mean_return:8.2f} pl={pl:7.3f} vl={vl:7.3f} best={best:8.2f}")
+            if it % 10 == 0:
+                ckpt_path = f"checkpoints/ckpt_it{it:05d}_R{mean_return:.2f}_eat{mean_eaten:.2f}_dead{death_rate*100:.0f}.pt"
+                save_checkpoint(ckpt_path, actor, critic, opt_a, opt_c, it=it, best=best,
+                                extra={"mean_return": mean_return, "mean_eaten": mean_eaten, "death_rate": death_rate, "mean_steps": mean_steps, "state_dim": state_dim})
+                print(f"it={it:4d} R={mean_return:8.2f} eat={mean_eaten:5.2f} dead={death_rate*100:5.1f}% steps={mean_steps:6.1f} pl={pl:7.3f} vl={vl:7.3f} best={best:8.2f}")
+
+            log_w.writerow([datetime.now().isoformat(timespec="seconds"), it,
+                            round(mean_return,6), round(mean_eaten,6), round(death_rate,6), round(mean_steps,6),
+                            round(pl,6), round(vl,6), round(best if best is not None else 0.0, 6), state_dim])
+            log_f.flush()
+    finally:
+        log_f.close()
 
     print("OK -> policy.pt sauvegardé")
 

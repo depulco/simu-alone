@@ -167,7 +167,7 @@ class Boule:
         self.immortal = True
 
     def starve(self):
-        if not self.immortal:
+        if not self.immortal and not self.dead :
             self.energy -=1
 
     def see_eyes(self,eye_type,object):
