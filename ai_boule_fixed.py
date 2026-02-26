@@ -11,7 +11,18 @@ from torch.distributions import Normal
 
 from create_simulation_fixed import create_sim_test_nn
 
+print("Torch version :", torch.__version__)
+print("CUDA dispo    :", torch.cuda.is_available())
+print("Nb GPU        :", torch.cuda.device_count())
+print("Device choisi :", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
+if torch.cuda.is_available():
+    print("GPU name      :", torch.cuda.get_device_name(0))
+    print("CUDA version  :", torch.version.cuda)
+    x = torch.rand(3, 3).to("cuda")
+    print("Test tensor GPU OK :", x.device, x)
+else:
+    print("Aucun GPU CUDA détecté, exécution sur CPU")
 # ----------------------------- Models -----------------------------
 class Actor(nn.Module):
     def __init__(self, state_dim: int, action_dim: int, hidden: int = 128):
@@ -240,12 +251,15 @@ def init_logger(path="train_log.csv"):
 
 
 # ----------------------------- PPO Update -----------------------------
-def ppo_update(actor, critic, opt_a, opt_c, states, actions, logps_old, returns, adv, device, clip_eps=0.2, entropy_coef=0.01):
+def ppo_update(actor, critic, opt_a, opt_c, states, actions, logps_old, returns, adv, device, clip_eps=0.2, entropy_coef=0.01, debug=False):
     states = torch.stack(states).to(device)
     actions = torch.stack(actions).to(device)
     logps_old = torch.stack(logps_old).detach().to(device)
     returns = torch.stack(returns).detach().to(device)
     adv = torch.stack(adv).detach().to(device)
+
+    if debug:
+        print(f"states={states.device}, actions={actions.device}, returns={returns.device}, adv={adv.device}")
 
     if states.shape[0] < 2:
         return 0.0, 0.0
@@ -307,10 +321,11 @@ def main():
 
     actor = Actor(state_dim, 3).to(device)
     critic = Critic(state_dim).to(device)
-
+    print("Actor device  :", next(actor.parameters()).device)
+    print("Critic device :", next(critic.parameters()).device)
     # ✅ ne charge policy.pt QUE si compatible
     if os.path.exists("policy.pt"):
-        sd = torch.load("policy.pt", map_location=device)
+        sd = torch.load("policy.pt", map_location=device, weights_only=True)
         if isinstance(sd, dict) and "actor" in sd:
             sd = sd["actor"]
         try:
@@ -339,9 +354,12 @@ def main():
                 continue
 
             pl, vl = 0.0, 0.0
-            for _ in range(PPO_EPOCHS):
-                pl, vl = ppo_update(actor, critic, opt_a, opt_c, states, actions, logps, rets, adv, device)
-
+            for epoch in range(PPO_EPOCHS):
+                pl, vl = ppo_update(
+                    actor, critic, opt_a, opt_c,
+                    states, actions, logps, rets, adv, device,
+                    debug=(it == 1 and epoch == 0)
+                )
             mean_return = mean([i["return"] for i in infos])
             mean_eaten  = mean([i["eaten"] for i in infos])
             death_rate  = mean([i["died"] for i in infos])
