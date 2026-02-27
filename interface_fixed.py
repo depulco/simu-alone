@@ -257,8 +257,8 @@ if __name__ == "__main__":
         EnvConfigTensor(
             width=500,
             height=500,
-            nb_food=12,
-            nb_spikes=0,
+            nb_food=20,
+            nb_spikes=10,
             max_steps=5000,
             device=device,
         ),

@@ -11,8 +11,8 @@ class EnvConfigTensor:
     max_steps: int = 600
     speed: float = 2.0
     rot_speed: float = 3.0
-    nb_spikes: int = 0
-    nb_food: int = 12
+    nb_spikes: int = 10
+    nb_food: int = 20
     device: str = "cuda"
 
 
