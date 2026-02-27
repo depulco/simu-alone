@@ -76,7 +76,7 @@ class Game:
     def change_model(self, delta):
         self.idx = (self.idx + delta) % len(self.files)
         self.policy = load_policy_any(self.files[self.idx], device=self.device)
-        print("✅ chargé:", self.files[self.idx])
+        print("chargé:", self.files[self.idx])
         self.set_caption()
         self.reset_env()
 
